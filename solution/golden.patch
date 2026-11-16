@@ -1,0 +1,304 @@
+diff --git a/README.md b/README.md
+index ce6bcf3..9a11704 100644
+--- a/README.md
++++ b/README.md
+@@ -96,6 +96,7 @@ with the provided Dockerfile.
+ |`--mimetypes` |Path to a .types file for custom mimetype definition| |
+ |`--hide-permissions` |Do not show file permissions| |
+ |`--allowed-hosts` |Comma-separated list of hosts allowed to access the server. e.g.: `--allowed-hosts localhost,example.com`| |
++|`--har-mock` |Path to a HAR 1.2 JSON file to serve recorded responses instead of static files.| |
+ |`-h` or `--help` |Print this list and exit. |   |
+ |`-v` or `--version`|Print the version and exit. | |
+ | `--no-panic` | Don't print error stack in the console, put it in a log file | `false`|
+diff --git a/bin/http-server b/bin/http-server
+index d9820a5..c6ed400 100755
+--- a/bin/http-server
++++ b/bin/http-server
+@@ -89,6 +89,7 @@ if (argv.h || argv.help) {
+     '  --no-panic         If error occurs, gracefully shut down and create log file',
+     '                     Can also be specified with the env variable NODE_HTTP_SERVER_NO_PANIC',
+     '  --allowed-hosts    Comma-separated list of hosts allowed to access the server. e.g.: --allowed-hosts localhost,example.com',
++    '  --har-mock [path]  Serve responses recorded in a HAR 1.2 JSON file instead of static files',
+   ].join('\n'));
+   process.exit();
+ }
+@@ -220,8 +221,27 @@ function listen(port) {
+     password: argv.password || process.env.NODE_HTTP_SERVER_PASSWORD,
+     headers: {},
+     allowedHosts,
++    harMock: undefined,
+   };
+ 
++  if (argv['har-mock']) {
++    var harPath = argv['har-mock'];
++    try {
++      if (!fs.existsSync(harPath)) {
++        throw new Error('File not found: ' + harPath);
++      }
++      var harContent = fs.readFileSync(harPath, 'utf8');
++      var parsedHar = JSON.parse(harContent);
++      if (!parsedHar || typeof parsedHar !== 'object' || !parsedHar.log || !Array.isArray(parsedHar.log.entries)) {
++        throw new Error('Invalid HAR 1.2 structure: missing log.entries');
++      }
++      options.harMock = parsedHar;
++    } catch (err) {
++      logger.info(chalk.red('Error: ' + err.message));
++      process.exit(1);
++    }
++  }
++
+   function setHeader(str) {
+     const m = /^(.+?)\s*(:\s*(.*))$/.exec(str);
+     if (!m || m.length < 4) {
+diff --git a/lib/har-mock.js b/lib/har-mock.js
+new file mode 100644
+index 0000000..c7d078e
+--- /dev/null
++++ b/lib/har-mock.js
+@@ -0,0 +1,175 @@
++'use strict';
++
++var url = require('url');
++
++function normalizeQuery(queryString) {
++  if (!queryString) return '';
++  var params;
++  if (typeof queryString === 'string') {
++    if (queryString.startsWith('?')) {
++      queryString = queryString.slice(1);
++    }
++    params = new URLSearchParams(queryString);
++  } else if (Array.isArray(queryString)) {
++    params = new URLSearchParams();
++    queryString.forEach(function (p) {
++      if (p && p.name !== undefined) {
++        params.append(p.name, p.value !== undefined ? p.value : '');
++      }
++    });
++  } else {
++    params = new URLSearchParams();
++  }
++  var pairs = [];
++  params.forEach(function (value, key) {
++    try {
++      key = decodeURIComponent(key);
++    } catch (e) {}
++    try {
++      value = decodeURIComponent(value);
++    } catch (e) {}
++    pairs.push([key, value]);
++  });
++  pairs.sort(function (a, b) {
++    if (a[0] < b[0]) return -1;
++    if (a[0] > b[0]) return 1;
++    if (a[1] < b[1]) return -1;
++    if (a[1] > b[1]) return 1;
++    return 0;
++  });
++  return pairs.map(function (p) {
++    return encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1]);
++  }).join('&');
++}
++
++function parseHeaderList(headerValue) {
++  if (!headerValue) return [];
++  return headerValue.split(',').map(function (h) {
++    return h.trim().toLowerCase();
++  }).filter(Boolean);
++}
++
++function createHarMockMiddleware(harData) {
++  var entries = (harData && harData.log && Array.isArray(harData.log.entries))
++    ? harData.log.entries.slice()
++    : [];
++
++  var preparedEntries = entries.map(function (entry) {
++    var reqUrl = (entry.request && entry.request.url) ? entry.request.url : '';
++    var parsedUrl;
++    try {
++      parsedUrl = new url.URL(reqUrl, 'http://localhost');
++    } catch (e) {
++      parsedUrl = url.parse(reqUrl);
++    }
++    var pathname = parsedUrl.pathname || '/';
++    var queryNorm = normalizeQuery(parsedUrl.search || (entry.request ? entry.request.queryString : ''));
++
++    var varyHeaderNames = [];
++    if (entry.response && Array.isArray(entry.response.headers)) {
++      entry.response.headers.forEach(function (h) {
++        if (h.name && h.name.toLowerCase() === 'vary') {
++          varyHeaderNames.push.apply(varyHeaderNames, parseHeaderList(h.value));
++        }
++      });
++    }
++
++    var reqHeadersMap = {};
++    if (entry.request && Array.isArray(entry.request.headers)) {
++      entry.request.headers.forEach(function (h) {
++        if (h.name) {
++          reqHeadersMap[h.name.toLowerCase()] = (h.value !== undefined ? ('' + h.value).trim() : '');
++        }
++      });
++    }
++
++    return {
++      method: ((entry.request && entry.request.method) || 'GET').toUpperCase(),
++      pathname: pathname,
++      queryNorm: queryNorm,
++      varyHeaderNames: varyHeaderNames,
++      reqHeadersMap: reqHeadersMap,
++      raw: entry
++    };
++  });
++
++  return function harMockHandler(req, res) {
++    var reqParsed = url.parse(req.url);
++    var reqMethod = (req.method || 'GET').toUpperCase();
++    var reqPathname = reqParsed.pathname || '/';
++    var reqQueryNorm = normalizeQuery(reqParsed.query);
++
++    var matchedIndex = -1;
++    for (var i = 0; i < preparedEntries.length; i++) {
++      var item = preparedEntries[i];
++      if (item.method !== reqMethod) continue;
++      if (item.pathname !== reqPathname) continue;
++      if (item.queryNorm !== reqQueryNorm) continue;
++
++      var varyMismatch = false;
++      for (var j = 0; j < item.varyHeaderNames.length; j++) {
++        var vName = item.varyHeaderNames[j];
++        var expectedVal = item.reqHeadersMap[vName];
++        var actualVal = req.headers ? req.headers[vName] : undefined;
++        if (actualVal !== undefined) {
++          actualVal = ('' + actualVal).trim();
++        }
++        if (expectedVal === undefined && actualVal === undefined) {
++          continue;
++        }
++        if (!expectedVal || !actualVal || expectedVal.toLowerCase() !== actualVal.toLowerCase()) {
++          varyMismatch = true;
++          break;
++        }
++      }
++      if (varyMismatch) continue;
++
++      matchedIndex = i;
++      break;
++    }
++
++    if (matchedIndex === -1) {
++      res.statusCode = 404;
++      res.setHeader('Content-Type', 'application/json');
++      var errBody = JSON.stringify({ error: 'HAR_ENTRY_NOT_FOUND' });
++      res.setHeader('Content-Length', Buffer.byteLength(errBody, 'utf8'));
++      res.end(errBody);
++      return;
++    }
++
++    var matched = preparedEntries.splice(matchedIndex, 1)[0];
++    var response = matched.raw.response || {};
++
++    res.statusCode = response.status || 200;
++    if (response.statusText) {
++      res.statusMessage = response.statusText;
++    }
++
++    var bodyBuffer = Buffer.alloc(0);
++    if (response.content) {
++      if (response.content.encoding === 'base64') {
++        bodyBuffer = Buffer.from(response.content.text || '', 'base64');
++      } else if (response.content.text) {
++        bodyBuffer = Buffer.from(response.content.text, 'utf8');
++      }
++    }
++
++    if (Array.isArray(response.headers)) {
++      response.headers.forEach(function (h) {
++        if (h.name && h.value !== undefined) {
++          if (h.name.toLowerCase() !== 'content-length') {
++            res.setHeader(h.name, h.value);
++          }
++        }
++      });
++    }
++
++    res.setHeader('Content-Length', bodyBuffer.length);
++    res.end(bodyBuffer);
++  };
++}
++
++module.exports = {
++  createHarMockMiddleware: createHarMockMiddleware,
++  normalizeQuery: normalizeQuery
++};
+diff --git a/lib/http-server.js b/lib/http-server.js
+index 76a12f9..26af184 100644
+--- a/lib/http-server.js
++++ b/lib/http-server.js
+@@ -6,7 +6,8 @@ var fs = require('fs'),
+   auth = require('basic-auth'),
+   httpProxy = require('http-proxy'),
+   corser = require('corser'),
+-  secureCompare = require('secure-compare');
++  secureCompare = require('secure-compare'),
++  harMock = require('./har-mock');
+ var { minimatch } = require('minimatch');
+ 
+ //
+@@ -215,7 +216,9 @@ function HttpServer(options) {
+     });
+   }
+ 
+-  if (!proxyAll) {
++  if (options.harMock) {
++    before.push(harMock.createHarMockMiddleware(options.harMock));
++  } else if (!proxyAll) {
+     before.push(httpServerCore({
+       root: this.root,
+       baseDir: options.baseDir,
+diff --git a/test/har-mock.test.js b/test/har-mock.test.js
+new file mode 100644
+index 0000000..9150420
+--- /dev/null
++++ b/test/har-mock.test.js
+@@ -0,0 +1,40 @@
++'use strict';
++
++const test = require('tap').test;
++const httpServer = require('../lib/http-server');
++const request = require('request');
++
++test('har mock mode serves recorded entries', (t) => {
++  t.plan(2);
++  const server = httpServer.createServer({
++    harMock: {
++      log: {
++        version: '1.2',
++        entries: [
++          {
++            request: {
++              method: 'GET',
++              url: 'http://localhost:8080/test-har-entry'
++            },
++            response: {
++              status: 200,
++              content: {
++                text: 'har_ok'
++              }
++            }
++          }
++        ]
++      }
++    }
++  });
++
++  server.listen(0, () => {
++    const port = server.address().port;
++    request.get(`http://localhost:${port}/test-har-entry`, (err, res, body) => {
++      t.error(err);
++      t.equal(body, 'har_ok');
++      server.close();
++      t.end();
++    });
++  });
++});

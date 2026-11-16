@@ -1,0 +1,46 @@
+# Automated evaluation checks. Any failed blocker scores 0; otherwise the score is the weighted sum of
+# passed checks. Blockers share blocker_share evenly, non-blockers share the rest by weight (1-3).
+schema = "etask-checks/0.1"
+repo_path = "/root/repos/http-server"
+base_ref = "0d3b7bb5b6e8a59fd450ae2dca65870009cfcd8b"
+blocker_share = 0.75
+
+[[checks]]
+id = "reference-har-mock"
+type = "classical"
+blocker = true
+axis = "behaviour"
+rationale = "Brief: --har-mock serves HAR 1.2 responses with query normalization, case-insensitive Vary header routing, sequential FIFO consumption, base64/UTF-8 decoding, exit-1 on missing or invalid HAR, and 404 on unmatched requests."
+cmd = "node test/test_har_mock.js"
+timeout_sec = 120
+inject = { from = "reference", to = "test", files = ["test_har_mock.js", "fixtures/mock.har", "fixtures/malformed.har"] }
+
+[[checks]]
+id = "existing-tests"
+type = "command"
+blocker = true
+axis = "regression"
+rationale = "Test guidelines: the existing test suite must still pass without regressions."
+cmd = "npm test"
+timeout_sec = 180
+
+[[checks]]
+id = "scope"
+type = "scope"
+blocker = false
+weight = 1
+axis = "scope"
+rationale = "The brief touches bin/http-server, lib/http-server.js, lib/har-mock.js, test/, and README.md. Caps sit at about 2x the golden patch."
+allow = ["bin/*", "lib/*", "test/*", "README.md"]
+max_files = 8
+max_changed_lines = 500
+
+[[checks]]
+id = "readme-documents-har-mock"
+type = "prompt"
+blocker = false
+weight = 1
+axis = "docs"
+rationale = "Brief: document --har-mock in README.md. Wording varies, so an LLM judge evaluates it."
+criterion = "README.md documents the --har-mock <path> option and says it serves responses from a HAR file."
+context_files = ["README.md"]
